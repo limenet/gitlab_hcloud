@@ -94,6 +94,8 @@ cargo run --release
 [gitlab]
 url = "https://gitlab.example.com"
 token = "glpat-xxxxxxxxxxxxxxxxxxxx"  # read_api scope
+# tag_filter = ["hetzner"]           # optional: only react to jobs with these tags
+# project_refresh_minutes = 10       # how often the project list is refreshed
 
 [hetzner]
 token = "xxxxxxxxxxxxxxxxxxxxxxxx"
@@ -105,15 +107,28 @@ ssh_key_name = "my-ssh-key"
 [runner]
 name = "flexi-runner"
 min_lifetime_minutes = 20  # Minimum runtime
-poll_interval_seconds = 30
+poll_interval_seconds = 30  # 10-300
 ```
 
 ## Debug vs Release
 
 | Feature          | Debug     | Release                              |
 | ---------------- | --------- | ------------------------------------ |
-| Polling interval | 5s        | 30s (from config)                    |
+| Polling interval | 15s       | 30s (from config)                    |
 | Server deletion  | Immediate | After min. 20min + billing-optimized |
+
+## GitLab API Usage / Rate Limits
+
+GitLab.com enforces API rate limits (stricter on the Free tier). To stay within them:
+
+- The project list (non-archived projects only) is cached and refreshed every `project_refresh_minutes`
+- Each poll makes **one** jobs request per project (pending + running combined; more only if a project has 100+ active jobs) and stops at the first matching job
+- While a server is running, GitLab is only polled when the server could actually be deleted (deletion window)
+- On HTTP 429 the scan is aborted and polling pauses for the `Retry-After` duration
+
+Rough worst case while idle: `3600 / poll_interval_seconds × number_of_projects` requests per hour.
+With many projects, increase `poll_interval_seconds` accordingly (up to 300s; idle servers are
+only deleted within a ~10-minute window per billing hour, so longer intervals could miss it).
 
 ## Billing Optimization
 

@@ -6,7 +6,7 @@
 use serde::Deserialize;
 use std::path::Path;
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Errors that can occur when loading configuration.
 #[derive(Error, Debug)]
@@ -39,6 +39,9 @@ pub struct GitLabConfig {
     /// Optional runner tag filter - only spin up a runner when a pending job has one of these tags.
     /// If absent, all pending jobs trigger a runner (original behavior).
     pub tag_filter: Option<Vec<String>>,
+    /// How often the project list is refreshed, in minutes (cached in between)
+    #[serde(default = "default_project_refresh")]
+    pub project_refresh_minutes: u64,
 }
 
 /// Hetzner Cloud configuration.
@@ -79,6 +82,18 @@ fn default_poll_interval() -> u64 {
     30
 }
 
+/// Default value for project list refresh: 10 minutes
+fn default_project_refresh() -> u64 {
+    10
+}
+
+/// Lowest accepted polling interval, to stay within GitLab API rate limits.
+const MIN_POLL_INTERVAL_SECONDS: u64 = 10;
+
+/// Highest accepted polling interval. Idle runners are only deleted within a
+/// ~10-minute window around each billing hour; longer intervals could miss it.
+const MAX_POLL_INTERVAL_SECONDS: u64 = 300;
+
 impl Config {
     /// Loads configuration from the specified file.
     ///
@@ -92,7 +107,21 @@ impl Config {
         info!("Loading configuration from: {}", path.display());
 
         let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
+        let mut config: Config = toml::from_str(&content)?;
+
+        if config.runner.poll_interval_seconds < MIN_POLL_INTERVAL_SECONDS {
+            warn!(
+                "poll_interval_seconds = {} is too low, using {}s to respect GitLab rate limits",
+                config.runner.poll_interval_seconds, MIN_POLL_INTERVAL_SECONDS
+            );
+            config.runner.poll_interval_seconds = MIN_POLL_INTERVAL_SECONDS;
+        } else if config.runner.poll_interval_seconds > MAX_POLL_INTERVAL_SECONDS {
+            warn!(
+                "poll_interval_seconds = {} is too high, using {}s so idle servers are deleted in time",
+                config.runner.poll_interval_seconds, MAX_POLL_INTERVAL_SECONDS
+            );
+            config.runner.poll_interval_seconds = MAX_POLL_INTERVAL_SECONDS;
+        }
 
         info!("Configuration loaded successfully");
         info!("  GitLab URL: {}", config.gitlab.url);
@@ -128,5 +157,6 @@ mod tests {
     fn test_default_values() {
         assert_eq!(default_min_lifetime(), 20);
         assert_eq!(default_poll_interval(), 30);
+        assert_eq!(default_project_refresh(), 10);
     }
 }

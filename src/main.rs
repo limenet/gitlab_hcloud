@@ -34,7 +34,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Lay
 use crate::cloud_init::generate_cloud_init;
 use crate::config::{load_runner_config, Config};
 use crate::csv_log::CsvLogger;
-use crate::gitlab::GitLabClient;
+use crate::gitlab::{GitLabClient, GitLabError};
 use crate::hetzner::HetznerClient;
 use crate::state::{OrchestratorState, RunnerState};
 
@@ -68,6 +68,8 @@ token = "glpat-xxxxxxxxxxxxxxxxxxxx"
 # Optional: only spin up a runner when a pending job has one of these tags.
 # Remove or leave empty to react to all pending jobs.
 # tag_filter = ["hetzner", "my-runner-tag"]
+# How often the project list is refreshed, in minutes (cached in between)
+# project_refresh_minutes = 10
 
 [hetzner]
 # Hetzner Cloud API Token
@@ -86,7 +88,8 @@ ssh_key_name = "my-ssh-key"
 name = "flexi-runner"
 # Minimum runtime in minutes before the server can be deleted
 min_lifetime_minutes = 20
-# Polling interval in seconds
+# Polling interval in seconds (10-300). Each poll makes about one GitLab API
+# request per project, so keep this high enough for GitLab's rate limits.
 poll_interval_seconds = 30
 "#;
 
@@ -183,9 +186,9 @@ async fn main() -> Result<()> {
     // Verify that saved state matches Hetzner
     verify_state_with_hetzner(&hetzner_client, &config.runner.name, &mut state).await?;
 
-    // Polling interval (Debug: 5s, Release: from config)
+    // Polling interval (Debug: 15s, Release: from config)
     let poll_interval_secs = if is_debug_build() {
-        5
+        15
     } else {
         config.runner.poll_interval_seconds
     };
@@ -199,6 +202,8 @@ async fn main() -> Result<()> {
 
     // Main loop
     loop {
+        let mut wait = poll_interval;
+
         if let Err(e) = orchestration_tick(
             &gitlab_client,
             &hetzner_client,
@@ -209,11 +214,17 @@ async fn main() -> Result<()> {
         )
         .await
         {
-            error!("Error in orchestration tick: {}", e);
+            // Back off when GitLab rate-limits us
+            if let Some(GitLabError::RateLimited { retry_after }) = e.downcast_ref() {
+                wait = wait.max(*retry_after);
+                warn!("Rate limited by GitLab - pausing for {}s", wait.as_secs());
+            } else {
+                error!("Error in orchestration tick: {}", e);
+            }
             // Continue on errors
         }
 
-        sleep(poll_interval).await;
+        sleep(wait).await;
     }
 }
 
@@ -285,6 +296,40 @@ async fn verify_state_with_hetzner(
     Ok(())
 }
 
+/// Why an idle runner is deleted in release builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteReason {
+    /// Minimum runtime reached and close to the next billing cycle
+    OptimalBillingTime,
+    /// Minimum runtime reached and just past a full hour,
+    /// otherwise we'd wait almost a full hour
+    AllPipelinesDone,
+}
+
+impl DeleteReason {
+    /// Reason string used in logs and the CSV log.
+    fn as_str(self) -> &'static str {
+        match self {
+            DeleteReason::OptimalBillingTime => "optimal_billing_time",
+            DeleteReason::AllPipelinesDone => "all_pipelines_done",
+        }
+    }
+}
+
+/// Returns the reason for deleting the runner if it is currently in a
+/// deletion window, i.e. a moment where an idle runner would be deleted.
+fn deletion_reason(runner: &RunnerState, min_lifetime_minutes: u32) -> Option<DeleteReason> {
+    if runner.should_delete(min_lifetime_minutes, BILLING_BUFFER_MINUTES) {
+        Some(DeleteReason::OptimalBillingTime)
+    } else if runner.can_force_delete(min_lifetime_minutes)
+        && runner.minutes_until_next_billing_cycle() > 55
+    {
+        Some(DeleteReason::AllPipelinesDone)
+    } else {
+        None
+    }
+}
+
 /// One pass of the orchestration logic.
 async fn orchestration_tick(
     gitlab_client: &GitLabClient,
@@ -294,20 +339,33 @@ async fn orchestration_tick(
     config: &Config,
     state: &mut OrchestratorState,
 ) -> Result<()> {
-    // Query GitLab for active jobs (filtered by tag if configured)
-    let active_jobs = gitlab_client
-        .find_active_jobs(config.gitlab.tag_filter.as_deref())
-        .await?;
-    let has_active = !active_jobs.is_empty();
+    // While a runner exists, the GitLab result only matters if the runner could
+    // be deleted right now. Outside a deletion window, skip the API calls.
+    // (Debug builds delete immediately, so they always need to poll.)
+    if let Some(runner) = &state.runner {
+        if !is_debug_build()
+            && deletion_reason(runner, config.runner.min_lifetime_minutes).is_none()
+        {
+            info!(
+                "Server running ({}min), {} minutes until billing - skipping GitLab poll",
+                runner.uptime_minutes(),
+                runner.minutes_until_next_billing_cycle()
+            );
+            return Ok(());
+        }
+    }
 
-    if has_active {
-        // There are active jobs - ensure server exists
-        if !state.has_runner() {
-            // No server present - create one
-            let first_job = &active_jobs[0];
+    // Query GitLab for an active job (filtered by tag if configured)
+    let active_job = gitlab_client
+        .find_first_active_job(config.gitlab.tag_filter.as_deref())
+        .await?;
+
+    match active_job {
+        Some(job) if !state.has_runner() => {
+            // Active job, no server present - create one
             info!(
                 "Active job found: {} (ID: {}) in {}",
-                first_job.job.status, first_job.job.id, first_job.project.path_with_namespace
+                job.job.status, job.job.id, job.project.path_with_namespace
             );
 
             create_runner(
@@ -316,26 +374,22 @@ async fn orchestration_tick(
                 cloud_init,
                 config,
                 state,
-                &first_job.project.path_with_namespace,
-                first_job.job.id,
+                &job.project.path_with_namespace,
+                job.job.id,
             )
             .await?;
-        } else {
+        }
+        Some(_) => {
             // Server is already running
             if let Some(uptime) = state.runner_uptime() {
-                info!(
-                    "Server running ({}min), {} active job(s)",
-                    uptime,
-                    active_jobs.len()
-                );
+                info!("Server running ({}min), active jobs present", uptime);
             }
         }
-    } else {
-        // No active jobs
-        if state.has_runner() {
+        None if state.has_runner() => {
             // Server is running, but no jobs anymore - check if we should delete
             maybe_delete_runner(hetzner_client, csv_logger, config, state).await?;
-        } else {
+        }
+        None => {
             info!("No active jobs, no server active - waiting...");
         }
     }
@@ -376,7 +430,9 @@ async fn create_runner(
 /// Checks if the server should be deleted and performs deletion if so.
 ///
 /// In debug build, the server is deleted immediately.
-/// In release build, it waits for optimal billing time.
+/// In release build, it waits for optimal billing time. The deletion window is
+/// re-checked here (after the GitLab scan) so a slow scan can't push the
+/// deletion past the billing boundary.
 async fn maybe_delete_runner(
     hetzner_client: &HetznerClient,
     csv_logger: &CsvLogger,
@@ -400,34 +456,25 @@ async fn maybe_delete_runner(
         return Ok(());
     }
 
-    // RELEASE BUILD: Wait for optimal billing time
-    let min_lifetime = config.runner.min_lifetime_minutes;
+    // RELEASE BUILD: Only delete within a deletion window
     let minutes_to_billing = runner.minutes_until_next_billing_cycle();
-
-    // Check if optimal delete time
-    let should_delete = runner.should_delete(min_lifetime, BILLING_BUFFER_MINUTES);
-
-    // Or: Minimum runtime reached and we don't want to wait forever
-    // (e.g., when we're just past a full hour)
-    let can_force_delete = runner.can_force_delete(min_lifetime);
-
-    if should_delete {
-        // Optimal time - delete
-        delete_runner(hetzner_client, csv_logger, state, "optimal_billing_time").await?;
-    } else if can_force_delete && minutes_to_billing > 55 {
-        // We're just past a full hour and minimum runtime is reached
-        // Deleting makes sense, otherwise we'd wait almost a full hour
-        info!(
-            "Force-delete: Minimum runtime reached ({}min), {} minutes until billing",
-            uptime, minutes_to_billing
-        );
-        delete_runner(hetzner_client, csv_logger, state, "all_pipelines_done").await?;
-    } else {
-        // Wait some more
-        info!(
-            "Server running for {}min, no pipelines active. {} minutes until billing - waiting...",
-            uptime, minutes_to_billing
-        );
+    match deletion_reason(runner, config.runner.min_lifetime_minutes) {
+        Some(reason) => {
+            if reason == DeleteReason::AllPipelinesDone {
+                info!(
+                    "Force-delete: Minimum runtime reached ({}min), {} minutes until billing",
+                    uptime, minutes_to_billing
+                );
+            }
+            delete_runner(hetzner_client, csv_logger, state, reason.as_str()).await?;
+        }
+        None => {
+            // Window closed during the GitLab scan - wait for the next one
+            info!(
+                "Server running for {}min, no pipelines active. {} minutes until billing - waiting...",
+                uptime, minutes_to_billing
+            );
+        }
     }
 
     Ok(())
@@ -466,4 +513,39 @@ async fn delete_runner(
 
     info!("Runner server deleted (runtime: {} minutes)", uptime);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    /// Runner that has been up for the given minutes (plus 30s, to avoid boundary flakiness).
+    fn runner_with_uptime(minutes: i64) -> RunnerState {
+        RunnerState {
+            server_id: 1,
+            server_name: "test-runner".to_string(),
+            created_at: Utc::now()
+                - chrono::Duration::minutes(minutes)
+                - chrono::Duration::seconds(30),
+        }
+    }
+
+    #[test]
+    fn test_deletion_reason() {
+        // Below minimum lifetime
+        assert_eq!(deletion_reason(&runner_with_uptime(10), 20), None);
+        // Mid billing hour - wait
+        assert_eq!(deletion_reason(&runner_with_uptime(30), 20), None);
+        // Within buffer before next billing cycle
+        assert_eq!(
+            deletion_reason(&runner_with_uptime(56), 20),
+            Some(DeleteReason::OptimalBillingTime)
+        );
+        // Just past a full hour
+        assert_eq!(
+            deletion_reason(&runner_with_uptime(62), 20),
+            Some(DeleteReason::AllPipelinesDone)
+        );
+    }
 }

@@ -1,5 +1,5 @@
 
-FROM rust:1.91-bullseye AS builder
+FROM rust:1.99-trixie AS builder
 
 WORKDIR /app
 
@@ -10,7 +10,7 @@ COPY . .
 
 RUN cargo build --release
 
-FROM debian:bullseye-slim AS runtime
+FROM debian:trixie-slim AS runtime
 
 ARG service
 
@@ -18,19 +18,18 @@ ARG service
 ENV USER=hcloud
 ENV UID=42069
 
-RUN adduser \
-    --disabled-password \
-    --gecos "" \
-    --home "/nonexistent" \
-    --shell "/sbin/nologin" \
+RUN useradd \
+    --home-dir "/nonexistent" \
+    --shell "/usr/sbin/nologin" \
     --no-create-home \
+    --user-group \
     --uid "${UID}" \
     "${USER}"
 
 # Install ca-certificates for HTTPS support
-RUN apt-get update
-RUN apt-get install -y ca-certificates
-RUN rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
